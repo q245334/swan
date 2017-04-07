@@ -30,6 +30,12 @@ type MetadataConfig struct {
 	CassandraSslCAPath         string
 	CassandraSslCertPath       string
 	CassandraSslKeyPath        string
+	CassandraTimeout           time.Duration
+	CassandraPort              int
+	CassandraInitialHostLookup bool
+	CassandraIgnorePeerAddr    bool
+	CassandraCreateKeyspace    bool
+	CassandraKeyspaceName      string
 }
 
 // DefaultMetadataConfig returns a setup which use a Cassandra cluster running on localhost
@@ -40,6 +46,12 @@ func DefaultMetadataConfig() MetadataConfig {
 		CassandraUsername:          "",
 		CassandraPassword:          "",
 		CassandraConnectionTimeout: 0,
+		CassandraTimeout:           0,
+		CassandraPort:              9042,
+		CassandraInitialHostLookup: true,
+		CassandraIgnorePeerAddr:    false,
+		CassandraCreateKeyspace:    true,
+		CassandraKeyspaceName:      "swan",
 		CassandraSslEnabled:        false,
 		CassandraSslHostValidation: false,
 		CassandraSslCAPath:         "",
@@ -48,6 +60,14 @@ func DefaultMetadataConfig() MetadataConfig {
 	}
 }
 
+// publisher.AddConfigItem("timeout", )
+// publisher.AddConfigItem("connectionTimeout", )
+// publisher.AddConfigItem("port", )
+// publisher.AddConfigItem("initialHostLookup", )
+// publisher.AddConfigItem("ignorePeerAddrRuleKey", )
+// publisher.AddConfigItem("createKeyspace", )
+// publisher.AddConfigItem("keyspaceName", )
+
 // MetadataConfigFromFlags applies the Cassandra settings from the command line flags and
 // environment variables.
 func MetadataConfigFromFlags() MetadataConfig {
@@ -55,7 +75,15 @@ func MetadataConfigFromFlags() MetadataConfig {
 		CassandraAddress:           conf.CassandraAddress.Value(),
 		CassandraUsername:          conf.CassandraUsername.Value(),
 		CassandraPassword:          conf.CassandraPassword.Value(),
-		CassandraConnectionTimeout: conf.CassandraConnectionTimeout.Value(),
+		CassandraConnectionTimeout: time.Duration(conf.CassandraConnectionTimeout.Value()) * time.Second,
+
+		CassandraTimeout:           time.Duration(conf.CassandraTimeout.Value()) * time.Second,
+		CassandraPort:              conf.CassandraPort.Value(),
+		CassandraInitialHostLookup: conf.CassandraInitialHostLookup.Value(),
+		CassandraIgnorePeerAddr:    conf.CassandraIgnorePeerAddr.Value(),
+		CassandraCreateKeyspace:    conf.CassandraCreateKeyspace.Value(),
+		CassandraKeyspaceName:      conf.CassandraKeyspaceName.Value(),
+
 		CassandraSslEnabled:        conf.CassandraSslEnabled.Value(),
 		CassandraSslHostValidation: conf.CassandraSslHostValidation.Value(),
 		CassandraSslCAPath:         conf.CassandraSslCAPath.Value(),
@@ -104,16 +132,40 @@ func sslOptions(config MetadataConfig) *gocql.SslOptions {
 	return sslOptions
 }
 
-// Connect creates a session to the Cassandra cluster. This function should only be called once.
-func (m *Metadata) Connect() error {
+func (m *Metadata) createConfig() *gocql.ClusterConfig {
+	// TODO(niklas): make consistency configurable.
 	cluster := gocql.NewCluster(m.config.CassandraAddress)
 
-	// TODO(niklas): make consistency configurable.
 	cluster.Consistency = gocql.LocalOne
 	cluster.SerialConsistency = gocql.LocalSerial
 
 	cluster.ProtoVersion = 4
-	cluster.Timeout = m.config.CassandraConnectionTimeout
+	cluster.ConnectionTimeout = m.config.CassandraConnectionTimeout
+	cluster.Timeout = m.config.CassandraTimeout
+	cluster.IgnorePeerAddr = m.config.CassandraIgnorePeerAddr
+	cluster.DisableInitialHostLookup = !m.config.CassandraInitialHostLookup
+
+	return cluster
+}
+
+func (m *Metadata) createKeyspace() error {
+	config := m.createConfig()
+	session, err := config.CreateSession()
+	defer session.Close()
+	if err != nil {
+		return fmt.Errorf("cannot achieve session for creating keyspace: %q", err.Error())
+	}
+
+	query := fmt.Sprintf("CREATE KEYSPACE IF NOT EXISTS %s WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};", m.config.CassandraKeyspaceName)
+
+	return session.Query(query).Exec()
+
+}
+
+// Connect creates a session to the Cassandra cluster. This function should only be called once.
+func (m *Metadata) Connect() error {
+	cluster = m.createConfig()
+	cluster.Keyspace = m.config.CassandraKeyspaceName
 
 	if m.config.CassandraUsername != "" && m.config.CassandraPassword != "" {
 		cluster.Authenticator = gocql.PasswordAuthenticator{
@@ -133,32 +185,32 @@ func (m *Metadata) Connect() error {
 
 	m.session = session
 
-	if err := session.Query("CREATE KEYSPACE IF NOT EXISTS swan WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};").Exec(); err != nil {
+	if m.conf.CassandraCreateKeyspace && m.createKeyspace(); err != nil {
 		return err
 	}
 
-	// NOTE: Schema consistency check is ignored by CREATE query. (https://git-wip-us.apache.org/repos/asf?p=cassandra.git;a=blob_plain;f=doc/native_protocol_v4.spec)
-	// To ensure schema consistency we perform a simple SELECT query on 'system_schema.keyspaces'.
-	// Consistency level is taken from 'cluster.Consistency' variable, it can also be defined for individual Query.
-	if err = session.Query("SELECT * FROM system_schema.keyspaces;").Exec(); err != nil {
+	// // NOTE: Schema consistency check is ignored by CREATE query. (https://git-wip-us.apache.org/repos/asf?p=cassandra.git;a=blob_plain;f=doc/native_protocol_v4.spec)
+	// // To ensure schema consistency we perform a simple SELECT query on 'system_schema.keyspaces'.
+	// // Consistency level is taken from 'cluster.Consistency' variable, it can also be defined for individual Query.
+	// if err = session.Query("SELECT * FROM system_schema.keyspaces;").Exec(); err != nil {
+	// 	return err
+	// }
+
+	if err = session.Query("CREATE TABLE IF NOT EXISTS metadata (experiment_id text, kind text, time timestamp, timeuuid TIMEUUID, metadata map<text,text>, PRIMARY KEY ((experiment_id), timeuuid),) WITH CLUSTERING ORDER BY (timeuuid DESC);").Exec(); err != nil {
 		return err
 	}
 
-	if err = session.Query("CREATE TABLE IF NOT EXISTS swan.metadata (experiment_id text, kind text, time timestamp, timeuuid TIMEUUID, metadata map<text,text>, PRIMARY KEY ((experiment_id), timeuuid),) WITH CLUSTERING ORDER BY (timeuuid DESC);").Exec(); err != nil {
-		return err
-	}
-
-	// NOTE: Same issue as above.
-	if err = session.Query("SELECT * FROM system_schema.keyspaces;").Exec(); err != nil {
-		return err
-	}
+	// // NOTE: Same issue as above.
+	// if err = session.Query("SELECT * FROM system_schema.keyspaces;").Exec(); err != nil {
+	// 	return err
+	// }
 
 	return nil
 }
 
 // storeMap
 func (m *Metadata) storeMap(metadata MetadataMap, kind string) error {
-	err := m.session.Query(`INSERT INTO swan.metadata (experiment_id, kind, time, timeuuid, metadata) VALUES (?, ?, ?, ?, ?)`, m.experimentID, kind, time.Now(), gocql.TimeUUID(), metadata).Exec()
+	err := m.session.Query(`INSERT INTO metadata (experiment_id, kind, time, timeuuid, metadata) VALUES (?, ?, ?, ?, ?)`, m.experimentID, kind, time.Now(), gocql.TimeUUID(), metadata).Exec()
 	return errors.Wrapf(err, "cannot publish metadata of kind %q", kind)
 }
 
@@ -212,7 +264,7 @@ func (m *Metadata) Get() ([]MetadataMap, error) {
 
 	out := []MetadataMap{}
 
-	iter := m.session.Query(`SELECT metadata FROM swan.metadata WHERE experiment_id = ?`, m.experimentID).Iter()
+	iter := m.session.Query(`SELECT metadata FROM metadata WHERE experiment_id = ?`, m.experimentID).Iter()
 	for iter.Scan(&metadata) {
 		out = append(out, metadata)
 	}
@@ -230,7 +282,7 @@ func (m *Metadata) GetGroup(kind string) (MetadataMap, error) {
 
 	maps := []MetadataMap{}
 
-	iter := m.session.Query(`SELECT metadata FROM swan.metadata WHERE experiment_id = ? AND group = ? ALLOW FILTERING`, m.experimentID, kind).Iter()
+	iter := m.session.Query(`SELECT metadata FROM metadata WHERE experiment_id = ? AND group = ? ALLOW FILTERING`, m.experimentID, kind).Iter()
 	for iter.Scan(&metadata) {
 		maps = append(maps, metadata)
 	}
@@ -247,7 +299,7 @@ func (m *Metadata) GetGroup(kind string) (MetadataMap, error) {
 
 // Clear deletes all metadata entries associated with the current experiment id.
 func (m *Metadata) Clear() error {
-	if err := m.session.Query(`DELETE FROM swan.metadata WHERE experiment_id = ?`,
+	if err := m.session.Query(`DELETE FROM metadata WHERE experiment_id = ?`,
 		m.experimentID).Exec(); err != nil {
 		return err
 	}
