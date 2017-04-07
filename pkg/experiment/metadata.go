@@ -60,14 +60,6 @@ func DefaultMetadataConfig() MetadataConfig {
 	}
 }
 
-// publisher.AddConfigItem("timeout", )
-// publisher.AddConfigItem("connectionTimeout", )
-// publisher.AddConfigItem("port", )
-// publisher.AddConfigItem("initialHostLookup", )
-// publisher.AddConfigItem("ignorePeerAddrRuleKey", )
-// publisher.AddConfigItem("createKeyspace", )
-// publisher.AddConfigItem("keyspaceName", )
-
 // MetadataConfigFromFlags applies the Cassandra settings from the command line flags and
 // environment variables.
 func MetadataConfigFromFlags() MetadataConfig {
